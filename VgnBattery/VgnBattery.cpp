@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <cwchar>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -37,7 +38,6 @@ static constexpr DWORD  REPORT_LEN = 64;          // report id + 63 字节载荷
 static constexpr DWORD  REPLY_WAIT_MS = 1500;     // 键盘休眠时响应延迟约 1s
 static constexpr int    BUSY_ATTEMPTS = 4;        // 单轮查询对休眠的重试次数
 
-static constexpr DWORD POLL_OK_MS = 60000;        // 拿到数据后的轮询间隔
 static constexpr DWORD POLL_RETRY_MS = 5000;      // 无设备/休眠时的轮询间隔
 
 // 匹配 VGN 配置通道: FF1C/0092 的 64 字节带编号 in/out 报文集合。
@@ -74,6 +74,98 @@ static std::atomic<bool> g_draw_taskbar{ true };
 static HANDLE g_thread = nullptr;
 static HANDLE g_stop_event = nullptr;
 static std::atomic<bool> g_running{ false };
+
+// ── 设置: 刷新间隔 (TM 插件配置目录的 ini 持久化) ────────────────────────────
+static std::atomic<int> g_poll_sec{ 60 };   // 拿到数据后的轮询间隔, 秒
+static wchar_t g_config_dir[MAX_PATH] = L"";
+static HMODULE g_self = nullptr;            // 选项对话框创建控件用, DllMain 记录
+
+static const wchar_t* const INI_FILE = L"vgn_keyboard_battery.ini";
+static const int POLL_SEC_MIN = 5;
+static const int POLL_SEC_MAX = 86400;
+
+static DWORD PollOkMs() { return (DWORD)g_poll_sec.load() * 1000u; }
+
+static void LoadSettings() {
+    if (g_config_dir[0] == L'\0') return;
+    wchar_t path[MAX_PATH];
+    swprintf_s(path, L"%ls\\%ls", g_config_dir, INI_FILE);
+    int v = (int)GetPrivateProfileIntW(L"settings", L"poll_interval_sec",
+                                       g_poll_sec.load(), path);
+    if (v < POLL_SEC_MIN) v = POLL_SEC_MIN;
+    if (v > POLL_SEC_MAX) v = POLL_SEC_MAX;
+    g_poll_sec = v;
+}
+
+static void SaveSettings() {
+    if (g_config_dir[0] == L'\0') return;   // 旧版 TM 不推送配置目录, 仅本次会话生效
+    wchar_t path[MAX_PATH];
+    swprintf_s(path, L"%ls\\%ls", g_config_dir, INI_FILE);
+    wchar_t buf[16];
+    _itow_s(g_poll_sec.load(), buf, 10);
+    WritePrivateProfileStringW(L"settings", L"poll_interval_sec", buf, path);
+}
+
+// 极简模态对话框: 空模板 + WM_INITDIALOG 动态建控件 (纯 Win32 无资源文件)
+static const wchar_t* const DLG_TITLE = L"VGN 键盘电量 设置";
+static const int IDC_EDIT_SEC = 1001;
+
+static INT_PTR CALLBACK PollDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_INITDIALOG: {
+        CreateWindowW(L"STATIC", L"刷新间隔(秒, 5~86400):",
+                      WS_CHILD | WS_VISIBLE, 10, 14, 190, 16,
+                      dlg, nullptr, g_self, nullptr);
+        wchar_t cur[16];
+        _itow_s(g_poll_sec.load(), cur, 10);
+        CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", cur,
+                        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER,
+                        10, 36, 90, 22, dlg, (HMENU)(INT_PTR)IDC_EDIT_SEC,
+                        g_self, nullptr);
+        CreateWindowW(L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE,
+                      120, 34, 50, 24, dlg, (HMENU)IDOK, g_self, nullptr);
+        CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE,
+                      175, 34, 50, 24, dlg, (HMENU)IDCANCEL, g_self, nullptr);
+        return TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK) {
+            wchar_t buf[16] = L"";
+            HWND edit = GetDlgItem(dlg, IDC_EDIT_SEC);
+            if (edit) GetWindowTextW(edit, buf, 16);
+            int v = _wtoi(buf);
+            if (v < POLL_SEC_MIN) v = POLL_SEC_MIN;
+            if (v > POLL_SEC_MAX) v = POLL_SEC_MAX;
+            g_poll_sec = v;
+            SaveSettings();
+            EndDialog(dlg, IDOK);
+        } else if (LOWORD(wp) == IDCANCEL) {
+            EndDialog(dlg, IDCANCEL);
+        }
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static ITMPlugin::OptionReturn ShowPollDialog(void* h_parent) {
+    // 模板只有框架 (无 DS_SETFONT, 无条目), 标题后即结束
+    struct { DLGTEMPLATE tpl; WORD extra[48]; } mem = {};
+    mem.tpl.style = WS_POPUP | WS_CAPTION | DS_MODALFRAME | DS_CENTER;
+    mem.tpl.cdit = 0;
+    mem.tpl.cx = 160;   // 对话框单位
+    mem.tpl.cy = 62;
+    LPWORD p = mem.extra;
+    *p++ = 0;                                  // 菜单: 无
+    *p++ = 0;                                  // 窗口类: 默认对话框类
+    const wchar_t* t = DLG_TITLE;
+    while (*t) *p++ = (WORD)*t++;
+    *p++ = 0;
+    INT_PTR r = DialogBoxIndirectParamW(g_self, &mem.tpl, (HWND)h_parent,
+                                        PollDlgProc, 0);
+    return r == IDOK ? ITMPlugin::OR_OPTION_CHANGED
+                     : ITMPlugin::OR_OPTION_UNCHANGED;
+}
 
 // ── 帧编解码 ────────────────────────────────────────────────────────────────
 // 电量查询帧: report id 0x04 + 载荷 00 00 1A 06 00 00 00 (其余补零)
@@ -291,7 +383,7 @@ static DWORD WINAPI WorkerProc(LPVOID) {
             if (got_ok) {
                 g_link_state = LinkState::LINKED;
                 PublishState(fresh, LinkState::LINKED);
-                if (WaitForSingleObject(g_stop_event, POLL_OK_MS) != WAIT_TIMEOUT)
+                if (WaitForSingleObject(g_stop_event, PollOkMs()) != WAIT_TIMEOUT)
                     break;
             } else if (any_busy) {
                 // 键盘休眠: 有上次数据就继续显示, 否则提示敲一下键盘
@@ -358,16 +450,17 @@ class CVgnPlugin : public ITMPlugin {
 public:
     IPluginItem* GetItem(int index) override { return index == 0 ? &m_item : nullptr; }
     void DataRequired() override {}   // 数据由后台线程维护, 这里无需做事
+    OptionReturn ShowOptionsDialog(void* hParent) override { return ShowPollDialog(hParent); }
 
     const wchar_t* GetInfo(PluginInfoIndex index) override {
         switch (index) {
         case TMI_NAME:        return L"VGN 键盘电量";
         case TMI_DESCRIPTION: return L"显示 VGN (Telink 方案) 无线键盘的电量, "
                                     L"支持 2.4G 接收器连接, 直接 HID 通信无需官方驱动。";
-        case TMI_AUTHOR:      return L"reverse-engineered with ZCode";
+        case TMI_AUTHOR:      return L"haukuen";
         case TMI_COPYRIGHT:   return L"MIT";
         case TMI_VERSION:     return L"1.0";
-        case TMI_URL:         return L"https://hub.vgnlab.com.cn/";
+        case TMI_URL:         return L"https://github.com/haukuen/TrafficMonitor-Plugin";
         default:              return L"";
         }
     }
@@ -390,12 +483,21 @@ public:
         case EI_DRAW_TASKBAR_WND:
             g_draw_taskbar = wcscmp(data, L"1") == 0;
             break;
+        case EI_CONFIG_DIR: {
+            wcsncpy_s(g_config_dir, data, _TRUNCATE);
+            // 去掉结尾反斜杠, 拼路径时统一自己加
+            size_t n = wcslen(g_config_dir);
+            while (n > 0 && (g_config_dir[n - 1] == L'\\' || g_config_dir[n - 1] == L'/'))
+                g_config_dir[--n] = L'\0';
+            LoadSettings();
+            break;
+        }
         default:
             break;
         }
     }
 
-    void OnInitialize(ITrafficMonitor* /*pApp*/) override { StartWorker(); }
+    void OnInitialize(ITrafficMonitor* /*pApp*/) override { LoadSettings(); StartWorker(); }
 
 private:
     void StartWorker() {
@@ -431,6 +533,7 @@ static void StopWorker() {
 
 BOOL APIENTRY DllMain(HMODULE h_module, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
+        g_self = h_module;
         DisableThreadLibraryCalls(h_module);
     } else if (reason == DLL_PROCESS_DETACH && reserved == nullptr) {
         // reserved 非空 = 进程正在终止, 无需 (也不能) 安全清理

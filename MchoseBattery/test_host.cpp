@@ -43,6 +43,34 @@ int wmain() {
         Sleep(3000);
     }
 
+    // 冒烟测试选项对话框: 模拟 TM 推送配置目录, 后台线程自动点"确定" (0=已修改 1=未修改)
+    wchar_t cfg_dir[MAX_PATH] = L"";
+    GetTempPathW(MAX_PATH, cfg_dir);
+    wcscat_s(cfg_dir, L"tm_plugin_cfg_test");
+    CreateDirectoryW(cfg_dir, nullptr);
+    plugin->OnExtenedInfo(ITMPlugin::EI_CONFIG_DIR, cfg_dir);
+    HANDLE auto_ok = CreateThread(nullptr, 0,
+        [](LPVOID) -> DWORD {
+            for (int i = 0; i < 50; ++i) {
+                Sleep(100);
+                HWND dlg = FindWindowW(L"#32770", L"迈从鼠标电量 设置");
+                if (dlg != nullptr) {
+                    PostMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDOK, 0), 0);
+                    break;
+                }
+            }
+            return 0;
+        }, nullptr, 0, nullptr);
+    auto opt = plugin->ShowOptionsDialog(nullptr);
+    wprintf(L"ShowOptionsDialog -> %d\n", (int)opt);
+    if (auto_ok) { WaitForSingleObject(auto_ok, 2000); CloseHandle(auto_ok); }
+    wchar_t ini_val[16] = L"";
+    wchar_t ini_path[MAX_PATH] = L"";
+    swprintf_s(ini_path, L"%ls\\mchose_battery.ini", cfg_dir);
+    GetPrivateProfileStringW(L"settings", L"poll_interval_sec", L"(missing)",
+                             ini_val, 16, ini_path);
+    wprintf(L"ini: %ls -> poll_interval_sec=%ls\n", ini_path, ini_val);
+
     FreeLibrary(dll);   // 触发 DllMain 卸载清理, 验证线程能干净退出
     wprintf(L"DLL 已卸载, 测试结束\n");
     return 0;
