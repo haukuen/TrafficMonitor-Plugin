@@ -1,0 +1,23 @@
+# build intermediates & outputs
+*.obj
+*.exp
+*.lib
+*.exe
+*.dll
+*.dll.old
+*.pdb
+*.ipdb
+*.iobj
+
+# VS
+.vs/
+*.user
+
+deploy.bat
+build.bat
+build_all.bat
+
+Thumbs.db
+desktop.ini
+*.log
+MchoseBattery/PROTOCOL.md
